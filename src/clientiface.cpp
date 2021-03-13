@@ -209,6 +209,13 @@ void RemoteClient::GetNextBlocks (
 	s16 d_max_gen = std::min(adjustDist(m_max_gen_distance, prop_zoom_fov),
 		wanted_range);
 
+	s16 d_max = full_d_max;
+
+	// Don't loop very much at a time
+	s16 max_d_increment_at_time = 2;
+	if (d_max > d_start + max_d_increment_at_time)
+		d_max = d_start + max_d_increment_at_time;
+
 	// cos(angle between velocity and camera) * |velocity|
 	// Limit to 0.0f in case player moves backwards.
 	f32 dot = rangelim(camera_dir.dotProduct(playerspeed), 0.0f, 300.0f);
@@ -225,7 +232,7 @@ void RemoteClient::GetNextBlocks (
 	const v3s16 cam_pos_nodes = floatToInt(camera_pos, BS);
 
 	s16 d;
-	for (d = d_start; d <= full_d_max; d++) {
+	for (d = d_start; d <= d_max; d++) {
 		/*
 			Get the border/face dot coordinates of a "d-radiused"
 			box
@@ -298,20 +305,14 @@ void RemoteClient::GetNextBlocks (
 			*/
 			MapBlock *block = env->getMap().getBlockNoCreateNoEx(p);
 
-			bool surely_not_found_on_disk = false;
-			bool block_is_invalid = false;
+			bool block_not_found = false;
 			if (block) {
 				// Reset usage timer, this block will be of use in the future.
 				block->resetUsageTimer();
 
-				// Block is dummy if data doesn't exist.
-				// It means it has been not found from disk and not generated
-				if (block->isDummy()) {
-					surely_not_found_on_disk = true;
-				}
-
-				if (!block->isGenerated())
-					block_is_invalid = true;
+				// Check whether the block exists (with data)
+				if (block->isDummy() || !block->isGenerated())
+					block_not_found = true;
 
 				/*
 					If block is not close, don't send it unless it is near
@@ -325,7 +326,7 @@ void RemoteClient::GetNextBlocks (
 						continue;
 				}
 
-				if (m_occ_cull && !block_is_invalid &&
+				if (m_occ_cull && !block_not_found &&
 						env->getMap().isBlockOccluded(block, cam_pos_nodes)) {
 					continue;
 				}
@@ -335,7 +336,7 @@ void RemoteClient::GetNextBlocks (
 				If block has been marked to not exist on disk (dummy) or is
 				not generated and generating new ones is not wanted, skip block.
 			*/
-			if (!generate && (surely_not_found_on_disk || block_is_invalid)) {
+			if (!generate && block_not_found) {
 				// get next one.
 				continue;
 			}
@@ -343,7 +344,7 @@ void RemoteClient::GetNextBlocks (
 			/*
 				Add inexistent block to emerge queue.
 			*/
-			if (block == NULL || surely_not_found_on_disk || block_is_invalid) {
+			if (block == NULL || block_not_found) {
 				if (emerge->enqueueBlockEmerge(peer_id, p, generate)) {
 					if (nearest_emerged_d == -1)
 						nearest_emerged_d = d;
@@ -450,9 +451,6 @@ void RemoteClient::notifyEvent(ClientStateEvent event)
 		switch (event) {
 		case CSE_Hello:
 			m_state = CS_HelloSent;
-			break;
-		case CSE_InitLegacy:
-			m_state = CS_AwaitingInit2;
 			break;
 		case CSE_Disconnect:
 			m_state = CS_Disconnecting;

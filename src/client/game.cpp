@@ -68,6 +68,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "util/pointedthing.h"
 #include "util/quicktune_shortcutter.h"
 #include "irrlicht_changes/static_text.h"
+#include "irr_ptr.h"
 #include "version.h"
 #include "script/scripting_client.h"
 #include "hud.h"
@@ -171,13 +172,7 @@ struct LocalFormspecHandler : public TextDest
 				return;
 			}
 
-			if (fields.find("quit") != fields.end()) {
-				return;
-			}
-
-			if (fields.find("btn_continue") != fields.end()) {
-				return;
-			}
+			return;
 		}
 
 		if (m_formname == "MT_DEATH_SCREEN") {
@@ -186,7 +181,7 @@ struct LocalFormspecHandler : public TextDest
 			return;
 		}
 
-		if (m_client && m_client->modsLoaded())
+		if (m_client->modsLoaded())
 			m_client->getScript()->on_formspec_input(m_formname, fields);
 	}
 
@@ -424,6 +419,7 @@ class GameGlobalShaderConstantSetter : public IShaderConstantSetter
 	CachedVertexShaderSetting<float> m_animation_timer_vertex;
 	CachedPixelShaderSetting<float> m_animation_timer_pixel;
 	CachedPixelShaderSetting<float, 3> m_day_light;
+	CachedPixelShaderSetting<float, 4> m_star_color;
 	CachedPixelShaderSetting<float, 3> m_eye_position_pixel;
 	CachedVertexShaderSetting<float, 3> m_eye_position_vertex;
 	CachedPixelShaderSetting<float, 3> m_minimap_yaw;
@@ -456,6 +452,7 @@ public:
 		m_animation_timer_vertex("animationTimer"),
 		m_animation_timer_pixel("animationTimer"),
 		m_day_light("dayLight"),
+		m_star_color("starColor"),
 		m_eye_position_pixel("eyePosition"),
 		m_eye_position_vertex("eyePosition"),
 		m_minimap_yaw("yawVec"),
@@ -473,12 +470,8 @@ public:
 		g_settings->deregisterChangedCallback("enable_fog", settingsCallback, this);
 	}
 
-	virtual void onSetConstants(video::IMaterialRendererServices *services,
-			bool is_highlevel)
+	void onSetConstants(video::IMaterialRendererServices *services) override
 	{
-		if (!is_highlevel)
-			return;
-
 		// Background color
 		video::SColor bgcolor = m_sky->getBgColor();
 		video::SColorf bgcolorf(bgcolor);
@@ -506,6 +499,10 @@ public:
 			sunlight.g,
 			sunlight.b };
 		m_day_light.set(dnc, services);
+
+		video::SColorf star_color = m_sky->getCurrentStarColor();
+		float clr[4] = {star_color.r, star_color.g, star_color.b, star_color.a};
+		m_star_color.set(clr, services);
 
 		u32 animation_timer = porting::getTimeMs() % 1000000;
 		float animation_timer_f = (float)animation_timer / 100000.f;
@@ -581,7 +578,7 @@ public:
 
 	virtual IShaderConstantSetter* create()
 	{
-		GameGlobalShaderConstantSetter *scs = new GameGlobalShaderConstantSetter(
+		auto *scs = new GameGlobalShaderConstantSetter(
 				m_sky, m_force_fog_off, m_fog_range, m_client);
 		if (!m_sky)
 			created_nosky.push_back(scs);
@@ -650,6 +647,8 @@ struct ClientEventHandler
 /****************************************************************************
  THE GAME
  ****************************************************************************/
+
+using PausedNodesList = std::vector<std::pair<irr_ptr<scene::IAnimatedMeshSceneNode>, float>>;
 
 /* This is not intended to be a public class. If a public class becomes
  * desirable then it may be better to create another 'wrapper' class that
@@ -800,6 +799,9 @@ private:
 	void showDeathFormspec();
 	void showPauseMenu();
 
+	void pauseAnimation();
+	void resumeAnimation();
+
 	// ClientEvent handlers
 	void handleClientEvent_None(ClientEvent *event, CameraOrientation *cam);
 	void handleClientEvent_PlayerDamage(ClientEvent *event, CameraOrientation *cam);
@@ -860,6 +862,9 @@ private:
 	Hud *hud = nullptr;
 	Minimap *mapper = nullptr;
 
+	// Map server hud ids to client hud ids
+	std::unordered_map<u32, u32> m_hud_server_to_client;
+
 	GameRunData runData;
 	Flags m_flags;
 
@@ -874,6 +879,7 @@ private:
 	std::string *error_message;
 	bool *reconnect_requested;
 	scene::ISceneNode *skybox;
+	PausedNodesList paused_animated_nodes;
 
 	bool simple_singleplayer_mode;
 	/* End 'cache' */
@@ -1336,7 +1342,7 @@ bool Game::createClient(const GameStartData &start_data)
 		return false;
 	}
 
-	GameGlobalShaderConstantSetterFactory *scsf = new GameGlobalShaderConstantSetterFactory(
+	auto *scsf = new GameGlobalShaderConstantSetterFactory(
 			&m_flags.force_fog_off, &runData.fog_range, client);
 	shader_src->addShaderConstantSetterFactory(scsf);
 
@@ -1346,32 +1352,20 @@ bool Game::createClient(const GameStartData &start_data)
 	/* Camera
 	 */
 	camera = new Camera(*draw_control, client);
-	if (!camera || !camera->successfullyCreated(*error_message))
+	if (!camera->successfullyCreated(*error_message))
 		return false;
 	client->setCamera(camera);
 
 	/* Clouds
 	 */
-	if (m_cache_enable_clouds) {
+	if (m_cache_enable_clouds)
 		clouds = new Clouds(smgr, -1, time(0));
-		if (!clouds) {
-			*error_message = "Memory allocation error (clouds)";
-			errorstream << *error_message << std::endl;
-			return false;
-		}
-	}
 
 	/* Skybox
 	 */
-	sky = new Sky(-1, texture_src);
+	sky = new Sky(-1, texture_src, shader_src);
 	scsf->setSky(sky);
 	skybox = NULL;	// This is used/set later on in the main run loop
-
-	if (!sky) {
-		*error_message = "Memory allocation error sky";
-		errorstream << *error_message << std::endl;
-		return false;
-	}
 
 	/* Pre-calculated values
 	 */
@@ -1402,12 +1396,6 @@ bool Game::createClient(const GameStartData &start_data)
 
 	hud = new Hud(guienv, client, player, &player->inventory);
 
-	if (!hud) {
-		*error_message = "Memory error: could not create HUD";
-		errorstream << *error_message << std::endl;
-		return false;
-	}
-
 	mapper = client->getMinimap();
 
 	if (mapper && client->modsLoaded())
@@ -1429,11 +1417,6 @@ bool Game::initGui()
 	// Chat backend and console
 	gui_chat_console = new GUIChatConsole(guienv, guienv->getRootGUIElement(),
 			-1, chat_backend, client, &g_menumgr);
-	if (!gui_chat_console) {
-		*error_message = "Could not allocate memory for chat console";
-		errorstream << *error_message << std::endl;
-		return false;
-	}
 
 #ifdef HAVE_TOUCHSCREENGUI
 
@@ -1489,9 +1472,6 @@ bool Game::connectToServer(const GameStartData &start_data,
 			*draw_control, texture_src, shader_src,
 			itemdef_manager, nodedef_manager, sound, eventmgr,
 			connect_address.isIPv6(), m_game_ui.get());
-
-	if (!client)
-		return false;
 
 	client->m_simple_singleplayer_mode = simple_singleplayer_mode;
 
@@ -2014,15 +1994,11 @@ void Game::processItemSelection(u16 *new_playeritem)
 
 	s32 dir = wheel;
 
-	if (input->joystick.wasKeyDown(KeyType::SCROLL_DOWN) ||
-			wasKeyDown(KeyType::HOTBAR_NEXT)) {
+	if (wasKeyDown(KeyType::HOTBAR_NEXT))
 		dir = -1;
-	}
 
-	if (input->joystick.wasKeyDown(KeyType::SCROLL_UP) ||
-			wasKeyDown(KeyType::HOTBAR_PREV)) {
+	if (wasKeyDown(KeyType::HOTBAR_PREV))
 		dir = 1;
-	}
 
 	if (dir < 0)
 		*new_playeritem = *new_playeritem < max_item ? *new_playeritem + 1 : 0;
@@ -2075,7 +2051,7 @@ void Game::openInventory()
 		TextDest *txt_dst = new TextDestPlayerInventory(client);
 		auto *&formspec = m_game_ui->updateFormspec("");
 		GUIFormSpecMenu::create(formspec, client, &input->joystick, fs_src,
-			txt_dst, client->getFormspecPrepend());
+			txt_dst, client->getFormspecPrepend(), sound);
 
 		formspec->setFormSpec(fs_src->getForm(), inventoryloc);
 	}
@@ -2449,7 +2425,7 @@ void Game::updatePlayerControl(const CameraOrientation &cam)
 		input->isKeyDown(KeyType::LEFT),
 		input->isKeyDown(KeyType::RIGHT),
 		isKeyDown(KeyType::JUMP),
-		isKeyDown(KeyType::SPECIAL1),
+		isKeyDown(KeyType::AUX1),
 		isKeyDown(KeyType::SNEAK),
 		isKeyDown(KeyType::ZOOM),
 		isKeyDown(KeyType::DIG),
@@ -2466,7 +2442,7 @@ void Game::updatePlayerControl(const CameraOrientation &cam)
 			( (u32)(isKeyDown(KeyType::LEFT)                          & 0x1) << 2) |
 			( (u32)(isKeyDown(KeyType::RIGHT)                         & 0x1) << 3) |
 			( (u32)(isKeyDown(KeyType::JUMP)                          & 0x1) << 4) |
-			( (u32)(isKeyDown(KeyType::SPECIAL1)                      & 0x1) << 5) |
+			( (u32)(isKeyDown(KeyType::AUX1)                          & 0x1) << 5) |
 			( (u32)(isKeyDown(KeyType::SNEAK)                         & 0x1) << 6) |
 			( (u32)(isKeyDown(KeyType::DIG)                           & 0x1) << 7) |
 			( (u32)(isKeyDown(KeyType::PLACE)                         & 0x1) << 8) |
@@ -2515,11 +2491,41 @@ inline void Game::step(f32 *dtime)
 	if (can_be_and_is_paused) { // This is for a singleplayer server
 		*dtime = 0;             // No time passes
 	} else {
+		if (simple_singleplayer_mode && !paused_animated_nodes.empty())
+			resumeAnimation();
+
 		if (server)
 			server->step(*dtime);
 
 		client->step(*dtime);
 	}
+}
+
+static void pauseNodeAnimation(PausedNodesList &paused, scene::ISceneNode *node) {
+	if (!node)
+		return;
+	for (auto &&child: node->getChildren())
+		pauseNodeAnimation(paused, child);
+	if (node->getType() != scene::ESNT_ANIMATED_MESH)
+		return;
+	auto animated_node = static_cast<scene::IAnimatedMeshSceneNode *>(node);
+	float speed = animated_node->getAnimationSpeed();
+	if (!speed)
+		return;
+	paused.push_back({grab(animated_node), speed});
+	animated_node->setAnimationSpeed(0.0f);
+}
+
+void Game::pauseAnimation()
+{
+	pauseNodeAnimation(paused_animated_nodes, smgr->getRootSceneNode());
+}
+
+void Game::resumeAnimation()
+{
+	for (auto &&pair: paused_animated_nodes)
+		pair.first->setAnimationSpeed(pair.second);
+	paused_animated_nodes.clear();
 }
 
 const ClientEventHandler Game::clientEventHandler[CLIENTEVENT_MAX] = {
@@ -2607,7 +2613,7 @@ void Game::handleClientEvent_ShowFormSpec(ClientEvent *event, CameraOrientation 
 
 		auto *&formspec = m_game_ui->updateFormspec(*(event->show_formspec.formname));
 		GUIFormSpecMenu::create(formspec, client, &input->joystick,
-			fs_src, txt_dst, client->getFormspecPrepend());
+			fs_src, txt_dst, client->getFormspecPrepend(), sound);
 	}
 
 	delete event->show_formspec.formspec;
@@ -2620,7 +2626,7 @@ void Game::handleClientEvent_ShowLocalFormSpec(ClientEvent *event, CameraOrienta
 	LocalFormspecHandler *txt_dst =
 		new LocalFormspecHandler(*event->show_formspec.formname, client);
 	GUIFormSpecMenu::create(m_game_ui->getFormspecGUI(), client, &input->joystick,
-			fs_src, txt_dst, client->getFormspecPrepend());
+			fs_src, txt_dst, client->getFormspecPrepend(), sound);
 
 	delete event->show_formspec.formspec;
 	delete event->show_formspec.formname;
@@ -2636,132 +2642,100 @@ void Game::handleClientEvent_HandleParticleEvent(ClientEvent *event,
 void Game::handleClientEvent_HudAdd(ClientEvent *event, CameraOrientation *cam)
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
-	auto &hud_server_to_client = client->getHUDTranslationMap();
 
-	u32 server_id = event->hudadd.server_id;
+	u32 server_id = event->hudadd->server_id;
 	// ignore if we already have a HUD with that ID
-	auto i = hud_server_to_client.find(server_id);
-	if (i != hud_server_to_client.end()) {
-		delete event->hudadd.pos;
-		delete event->hudadd.name;
-		delete event->hudadd.scale;
-		delete event->hudadd.text;
-		delete event->hudadd.align;
-		delete event->hudadd.offset;
-		delete event->hudadd.world_pos;
-		delete event->hudadd.size;
-		delete event->hudadd.text2;
+	auto i = m_hud_server_to_client.find(server_id);
+	if (i != m_hud_server_to_client.end()) {
+		delete event->hudadd;
 		return;
 	}
 
 	HudElement *e = new HudElement;
-	e->type   = (HudElementType)event->hudadd.type;
-	e->pos    = *event->hudadd.pos;
-	e->name   = *event->hudadd.name;
-	e->scale  = *event->hudadd.scale;
-	e->text   = *event->hudadd.text;
-	e->number = event->hudadd.number;
-	e->item   = event->hudadd.item;
-	e->dir    = event->hudadd.dir;
-	e->align  = *event->hudadd.align;
-	e->offset = *event->hudadd.offset;
-	e->world_pos = *event->hudadd.world_pos;
-	e->size = *event->hudadd.size;
-	e->z_index = event->hudadd.z_index;
-	e->text2  = *event->hudadd.text2;
-	hud_server_to_client[server_id] = player->addHud(e);
+	e->type   = static_cast<HudElementType>(event->hudadd->type);
+	e->pos    = event->hudadd->pos;
+	e->name   = event->hudadd->name;
+	e->scale  = event->hudadd->scale;
+	e->text   = event->hudadd->text;
+	e->number = event->hudadd->number;
+	e->item   = event->hudadd->item;
+	e->dir    = event->hudadd->dir;
+	e->align  = event->hudadd->align;
+	e->offset = event->hudadd->offset;
+	e->world_pos = event->hudadd->world_pos;
+	e->size      = event->hudadd->size;
+	e->z_index   = event->hudadd->z_index;
+	e->text2     = event->hudadd->text2;
+	m_hud_server_to_client[server_id] = player->addHud(e);
 
-	delete event->hudadd.pos;
-	delete event->hudadd.name;
-	delete event->hudadd.scale;
-	delete event->hudadd.text;
-	delete event->hudadd.align;
-	delete event->hudadd.offset;
-	delete event->hudadd.world_pos;
-	delete event->hudadd.size;
-	delete event->hudadd.text2;
+	delete event->hudadd;
 }
 
 void Game::handleClientEvent_HudRemove(ClientEvent *event, CameraOrientation *cam)
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
-	HudElement *e = player->removeHud(event->hudrm.id);
-	delete e;
+
+	auto i = m_hud_server_to_client.find(event->hudrm.id);
+	if (i != m_hud_server_to_client.end()) {
+		HudElement *e = player->removeHud(i->second);
+		delete e;
+		m_hud_server_to_client.erase(i);
+	}
+
 }
 
 void Game::handleClientEvent_HudChange(ClientEvent *event, CameraOrientation *cam)
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
 
-	u32 id = event->hudchange.id;
-	HudElement *e = player->getHud(id);
+	HudElement *e = nullptr;
 
-	if (e == NULL) {
-		delete event->hudchange.v3fdata;
-		delete event->hudchange.v2fdata;
-		delete event->hudchange.sdata;
-		delete event->hudchange.v2s32data;
+	auto i = m_hud_server_to_client.find(event->hudchange->id);
+	if (i != m_hud_server_to_client.end()) {
+		e = player->getHud(i->second);
+	}
+
+	if (e == nullptr) {
+		delete event->hudchange;
 		return;
 	}
 
-	switch (event->hudchange.stat) {
-		case HUD_STAT_POS:
-			e->pos = *event->hudchange.v2fdata;
-			break;
+#define CASE_SET(statval, prop, dataprop) \
+	case statval: \
+		e->prop = event->hudchange->dataprop; \
+		break
 
-		case HUD_STAT_NAME:
-			e->name = *event->hudchange.sdata;
-			break;
+	switch (event->hudchange->stat) {
+		CASE_SET(HUD_STAT_POS, pos, v2fdata);
 
-		case HUD_STAT_SCALE:
-			e->scale = *event->hudchange.v2fdata;
-			break;
+		CASE_SET(HUD_STAT_NAME, name, sdata);
 
-		case HUD_STAT_TEXT:
-			e->text = *event->hudchange.sdata;
-			break;
+		CASE_SET(HUD_STAT_SCALE, scale, v2fdata);
 
-		case HUD_STAT_NUMBER:
-			e->number = event->hudchange.data;
-			break;
+		CASE_SET(HUD_STAT_TEXT, text, sdata);
 
-		case HUD_STAT_ITEM:
-			e->item = event->hudchange.data;
-			break;
+		CASE_SET(HUD_STAT_NUMBER, number, data);
 
-		case HUD_STAT_DIR:
-			e->dir = event->hudchange.data;
-			break;
+		CASE_SET(HUD_STAT_ITEM, item, data);
 
-		case HUD_STAT_ALIGN:
-			e->align = *event->hudchange.v2fdata;
-			break;
+		CASE_SET(HUD_STAT_DIR, dir, data);
 
-		case HUD_STAT_OFFSET:
-			e->offset = *event->hudchange.v2fdata;
-			break;
+		CASE_SET(HUD_STAT_ALIGN, align, v2fdata);
 
-		case HUD_STAT_WORLD_POS:
-			e->world_pos = *event->hudchange.v3fdata;
-			break;
+		CASE_SET(HUD_STAT_OFFSET, offset, v2fdata);
 
-		case HUD_STAT_SIZE:
-			e->size = *event->hudchange.v2s32data;
-			break;
+		CASE_SET(HUD_STAT_WORLD_POS, world_pos, v3fdata);
 
-		case HUD_STAT_Z_INDEX:
-			e->z_index = event->hudchange.data;
-			break;
+		CASE_SET(HUD_STAT_SIZE, size, v2s32data);
 
-		case HUD_STAT_TEXT2:
-			e->text2 = *event->hudchange.sdata;
-			break;
+		CASE_SET(HUD_STAT_Z_INDEX, z_index, data);
+
+		CASE_SET(HUD_STAT_TEXT2, text2, sdata);
 	}
 
-	delete event->hudchange.v3fdata;
-	delete event->hudchange.v2fdata;
-	delete event->hudchange.sdata;
-	delete event->hudchange.v2s32data;
+#undef CASE_SET
+
+	delete event->hudchange;
 }
 
 void Game::handleClientEvent_SetSky(ClientEvent *event, CameraOrientation *cam)
@@ -3137,12 +3111,15 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud, bool show_debug)
 
 	input->clearWasKeyPressed();
 	input->clearWasKeyReleased();
+	// Ensure DIG & PLACE are marked as handled
+	wasKeyDown(KeyType::DIG);
+	wasKeyDown(KeyType::PLACE);
 
-	input->joystick.clearWasKeyDown(KeyType::MOUSE_L);
-	input->joystick.clearWasKeyDown(KeyType::MOUSE_R);
+	input->joystick.clearWasKeyPressed(KeyType::DIG);
+	input->joystick.clearWasKeyPressed(KeyType::PLACE);
 
-	input->joystick.clearWasKeyReleased(KeyType::MOUSE_L);
-	input->joystick.clearWasKeyReleased(KeyType::MOUSE_R);
+	input->joystick.clearWasKeyReleased(KeyType::DIG);
+	input->joystick.clearWasKeyReleased(KeyType::PLACE);
 }
 
 
@@ -3310,7 +3287,8 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 	const ItemStack &selected_item, const v3s16 &nodepos, const v3s16 &neighbourpos,
 	const PointedThing &pointed, const NodeMetadata *meta)
 {
-	std::string prediction = selected_def.node_placement_prediction;
+	const auto &prediction = selected_def.node_placement_prediction;
+
 	const NodeDefManager *nodedef = client->ndef();
 	ClientMap &map = client->getEnv().getClientMap();
 	MapNode node;
@@ -3340,7 +3318,7 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 
 		auto *&formspec = m_game_ui->updateFormspec("");
 		GUIFormSpecMenu::create(formspec, client, &input->joystick, fs_src,
-			txt_dst, client->getFormspecPrepend());
+			txt_dst, client->getFormspecPrepend(), sound);
 
 		formspec->setFormSpec(meta->getString("formspec"), inventoryloc);
 		return false;
@@ -3380,8 +3358,7 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 
 	if (!found) {
 		errorstream << "Node placement prediction failed for "
-			<< selected_def.name << " (places "
-			<< prediction
+			<< selected_def.name << " (places " << prediction
 			<< ") - Name not known" << std::endl;
 		// Handle this as if prediction was empty
 		// Report to server
@@ -3392,9 +3369,14 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 	const ContentFeatures &predicted_f = nodedef->get(id);
 
 	// Predict param2 for facedir and wallmounted nodes
+	// Compare core.item_place_node() for what the server does
 	u8 param2 = 0;
 
-	if (predicted_f.param_type_2 == CPT2_WALLMOUNTED ||
+	const u8 place_param2 = selected_def.place_param2;
+
+	if (place_param2) {
+		param2 = place_param2;
+	} else if (predicted_f.param_type_2 == CPT2_WALLMOUNTED ||
 			predicted_f.param_type_2 == CPT2_COLORED_WALLMOUNTED) {
 		v3s16 dir = nodepos - neighbourpos;
 
@@ -3405,9 +3387,7 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 		} else {
 			param2 = dir.Z < 0 ? 5 : 4;
 		}
-	}
-
-	if (predicted_f.param_type_2 == CPT2_FACEDIR ||
+	} else if (predicted_f.param_type_2 == CPT2_FACEDIR ||
 			predicted_f.param_type_2 == CPT2_COLORED_FACEDIR) {
 		v3s16 dir = nodepos - floatToInt(client->getEnv().getLocalPlayer()->getPosition(), BS);
 
@@ -3418,11 +3398,9 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 		}
 	}
 
-	assert(param2 <= 5);
-
-	//Check attachment if node is in group attached_node
-	if (((ItemGroupList) predicted_f.groups)["attached_node"] != 0) {
-		static v3s16 wallmounted_dirs[8] = {
+	// Check attachment if node is in group attached_node
+	if (itemgroup_get(predicted_f.groups, "attached_node") != 0) {
+		const static v3s16 wallmounted_dirs[8] = {
 			v3s16(0, 1, 0),
 			v3s16(0, -1, 0),
 			v3s16(1, 0, 0),
@@ -3447,11 +3425,11 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 	}
 
 	// Apply color
-	if ((predicted_f.param_type_2 == CPT2_COLOR
+	if (!place_param2 && (predicted_f.param_type_2 == CPT2_COLOR
 			|| predicted_f.param_type_2 == CPT2_COLORED_FACEDIR
 			|| predicted_f.param_type_2 == CPT2_COLORED_WALLMOUNTED)) {
-		const std::string &indexstr = selected_item.metadata.getString(
-			"palette_index", 0);
+		const auto &indexstr = selected_item.metadata.
+			getString("palette_index", 0);
 		if (!indexstr.empty()) {
 			s32 index = mystoi(indexstr);
 			if (predicted_f.param_type_2 == CPT2_COLOR) {
@@ -3491,11 +3469,10 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 			soundmaker->m_player_rightpunch_sound = selected_def.sound_place_failed;
 			return false;
 		}
-	} catch (InvalidPositionException &e) {
+	} catch (const InvalidPositionException &e) {
 		errorstream << "Node placement prediction failed for "
 			<< selected_def.name << " (places "
-			<< prediction
-			<< ") - Position not loaded" << std::endl;
+			<< prediction << ") - Position not loaded" << std::endl;
 		soundmaker->m_player_rightpunch_sound = selected_def.sound_place_failed;
 		return false;
 	}
@@ -4112,7 +4089,7 @@ void Game::showDeathFormspec()
 
 	auto *&formspec = m_game_ui->getFormspecGUI();
 	GUIFormSpecMenu::create(formspec, client, &input->joystick,
-		fs_src, txt_dst, client->getFormspecPrepend());
+		fs_src, txt_dst, client->getFormspecPrepend(), sound);
 	formspec->setFocus("btn_respawn");
 }
 
@@ -4246,9 +4223,12 @@ void Game::showPauseMenu()
 
 	auto *&formspec = m_game_ui->getFormspecGUI();
 	GUIFormSpecMenu::create(formspec, client, &input->joystick,
-			fs_src, txt_dst, client->getFormspecPrepend());
+			fs_src, txt_dst, client->getFormspecPrepend(), sound);
 	formspec->setFocus("btn_continue");
 	formspec->doPause = true;
+
+	if (simple_singleplayer_mode)
+		pauseAnimation();
 }
 
 /****************************************************************************/
